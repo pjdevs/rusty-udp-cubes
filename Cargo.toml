@@ -1,0 +1,15 @@
+[package]
+name = "rusty-udp-cubes"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ggez = { version = "0.10.0", features = ["rayon"] }
+
+[[bin]]
+name = "ruc-client"
+path = "src/client.rs"
+
+[[bin]]
+name = "ruc-server"
+path = "src/server.rs"
