@@ -88,6 +88,7 @@ struct World {
     next_player_id: u64,
     player_speed: f32,
     players_ttl: Duration,
+    ticks: u64,
 }
 
 impl World {
@@ -97,6 +98,7 @@ impl World {
             next_player_id: 0,
             player_speed,
             players_ttl,
+            ticks: 0,
         }
     }
 
@@ -155,14 +157,17 @@ impl World {
     fn step(&mut self, dt: f32) {
         self.disconnect_expired_players();
         self.move_players(dt);
+        self.ticks += 1;
     }
 
     fn snapshot(&self) -> String {
-        self.players
-            .values()
-            .map(|p| p.to_string())
-            .collect::<Vec<String>>()
-            .join("\n")
+        format!("{}\n", self.ticks)
+            + &self
+                .players
+                .values()
+                .map(|p| p.to_string())
+                .collect::<Vec<String>>()
+                .join("\n")
             + "\n"
     }
 }
@@ -250,7 +255,12 @@ fn run_udp_event_loop(
             handler.message_received(&socket, &from, &buffer[..len]);
 
             // Timer
-            recv_budget -= timer.elapsed();
+            let elapsed = timer.elapsed();
+            recv_budget = if elapsed > recv_budget {
+                Duration::ZERO
+            } else {
+                recv_budget - elapsed
+            }
         }
 
         // Step
