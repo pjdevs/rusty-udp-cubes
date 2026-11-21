@@ -18,6 +18,7 @@ struct Player {
     name: String,
     position: Vec2,
     direction: Vec2,
+    last_ping: Instant,
 }
 
 impl Display for Player {
@@ -86,37 +87,62 @@ struct World {
     players: HashMap<SocketAddr, Player>,
     next_player_id: u64,
     player_speed: f32,
+    players_ttl: Duration,
 }
 
 impl World {
-    fn new(player_speed: f32) -> Self {
+    fn new(player_speed: f32, players_ttl: Duration) -> Self {
         Self {
             players: HashMap::new(),
             next_player_id: 0,
             player_speed,
+            players_ttl,
         }
     }
 
     fn update_or_connect_player(&mut self, addr: &SocketAddr, player_input: PlayerInputPayload) {
-        let player = self.players.entry(*addr).or_insert_with(|| {
-            let id = self.next_player_id;
-            self.next_player_id += 1;
-            Player {
-                id: id,
-                name: String::new(),
+        if let Some(player) = self.players.get_mut(addr) {
+            player.name = player_input.name;
+            player.direction = player_input.direction;
+            player.last_ping = Instant::now();
+        } else {
+            let new_player = Player {
+                id: self.next_player_id,
+                name: player_input.name,
                 position: Vec2::new(100.0, 100.0),
-                direction: Vec2::ZERO,
-            }
-        });
-        player.name = player_input.name;
-        player.direction = player_input.direction;
+                direction: player_input.direction,
+                last_ping: Instant::now(),
+            };
+            self.next_player_id += 1;
+            self.players.insert(*addr, new_player);
+            Self::connected(self.players.get(addr).unwrap());
+        }
     }
 
     fn disconnect(&mut self, addr: &SocketAddr) {
-        self.players.remove(addr);
+        if let Some(player) = self.players.remove(addr) {
+            Self::disconnected(&player);
+        }
     }
 
-    fn step(&mut self, dt: f32) {
+    fn disconnect_expired_players(&mut self) {
+        for (_, player) in self
+            .players
+            .extract_if(|_, player| player.last_ping.elapsed() > self.players_ttl)
+        {
+            Self::disconnected(&player);
+        }
+    }
+
+    fn connected(player: &Player) {
+        println!("Connected player {player}");
+    }
+
+    fn disconnected(player: &Player) {
+        println!("Disconnected player {player}");
+    }
+
+    fn move_players(&mut self, dt: f32) {
         for (_, player) in &mut self.players {
             player.position += player.direction.normalize_or_zero() * self.player_speed * dt;
             player.position = Vec2::new(
@@ -124,6 +150,11 @@ impl World {
                 player.position.y.rem_euclid(WORLD_SIZE.y),
             );
         }
+    }
+
+    fn step(&mut self, dt: f32) {
+        self.disconnect_expired_players();
+        self.move_players(dt);
     }
 
     fn snapshot(&self) -> String {
@@ -181,7 +212,7 @@ impl EventHandler for World {
 
 fn run_udp_event_loop(
     address: &String,
-    fixed_update_millis: u64,
+    fixed_update: Duration,
     handler: &mut impl EventHandler,
 ) -> io::Result<()> {
     // Open socket
@@ -197,7 +228,7 @@ fn run_udp_event_loop(
     // Loop
     loop {
         let tick_start_time = Instant::now();
-        let mut recv_budget = Duration::from_millis(fixed_update_millis);
+        let mut recv_budget = fixed_update;
 
         // Receive loop while budget
         while recv_budget > Duration::ZERO {
@@ -231,7 +262,8 @@ fn run_udp_event_loop(
 }
 
 const PLAYER_SPEED: f32 = 250.0;
-const TICK_MILLIS: u64 = 16;
+const PLAYERS_TTL: Duration = Duration::from_millis(5000);
+const TICK_INTERVAL: Duration = Duration::from_millis(16);
 
 fn main() -> std::io::Result<()> {
     // Params
@@ -239,6 +271,6 @@ fn main() -> std::io::Result<()> {
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:4000".to_string());
 
-    let mut world = World::new(PLAYER_SPEED);
-    run_udp_event_loop(&address, TICK_MILLIS, &mut world)
+    let mut world = World::new(PLAYER_SPEED, PLAYERS_TTL);
+    run_udp_event_loop(&address, TICK_INTERVAL, &mut world)
 }
