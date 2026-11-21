@@ -5,7 +5,6 @@ use std::{
     fmt::Display,
     io::{self, ErrorKind},
     net::{SocketAddr, UdpSocket},
-    num::ParseFloatError,
     time::{Duration, Instant},
 };
 
@@ -31,27 +30,30 @@ impl Display for Player {
     }
 }
 
-enum PlayerInputParseError {
-    WrongFormat {
-        len: usize,
-    },
-    WrongValues {
-        error: ParseFloatError,
-        index: usize,
-    },
+enum PlayerPayloadParseError {
+    WrongFormat { len: usize },
+    WrongValues { error: String, index: usize },
 }
 
-impl Display for PlayerInputParseError {
+impl Display for PlayerPayloadParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::WrongFormat { len } => {
-                write!(f, "Expected 3 spaced args 'name X Y', received {len}")
+                write!(
+                    f,
+                    "Expected 3 spaced args 'name X Y' or 'bye', received {len} tokens"
+                )
             }
             Self::WrongValues { error, index } => {
-                write!(f, "Could not parse argument {index}: {error}")
+                write!(f, "Could not parse token {index}: {error}")
             }
         }
     }
+}
+
+enum PlayerPayload {
+    Bye,
+    Input(PlayerInputPayload),
 }
 
 struct PlayerInputPayload {
@@ -59,27 +61,44 @@ struct PlayerInputPayload {
     direction: Vec2,
 }
 
-impl TryFrom<&str> for PlayerInputPayload {
-    type Error = PlayerInputParseError;
+impl TryFrom<&str> for PlayerPayload {
+    type Error = PlayerPayloadParseError;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         let splits: Vec<&str> = value.split_whitespace().collect();
 
-        if splits.len() != 3 {
-            return Err(PlayerInputParseError::WrongFormat { len: splits.len() });
+        if splits.len() == 1 {
+            return if splits[0] == "bye" {
+                Ok(PlayerPayload::Bye)
+            } else {
+                Err(PlayerPayloadParseError::WrongValues {
+                    error: String::from("'bye' expected in a single token command"),
+                    index: 0,
+                })
+            };
         }
 
-        Ok(PlayerInputPayload {
+        if splits.len() != 3 {
+            return Err(PlayerPayloadParseError::WrongFormat { len: splits.len() });
+        }
+
+        Ok(PlayerPayload::Input(PlayerInputPayload {
             name: splits[0].to_string(),
             direction: Vec2 {
                 x: splits[1]
                     .parse::<f32>()
-                    .map_err(|e| PlayerInputParseError::WrongValues { error: e, index: 1 })?,
+                    .map_err(|e| PlayerPayloadParseError::WrongValues {
+                        error: e.to_string(),
+                        index: 1,
+                    })?,
                 y: splits[2]
                     .parse::<f32>()
-                    .map_err(|e| PlayerInputParseError::WrongValues { error: e, index: 2 })?,
+                    .map_err(|e| PlayerPayloadParseError::WrongValues {
+                        error: e.to_string(),
+                        index: 2,
+                    })?,
             },
-        })
+        }))
     }
 }
 
@@ -102,23 +121,30 @@ impl World {
         }
     }
 
-    fn update_or_connect_player(&mut self, addr: &SocketAddr, player_input: PlayerInputPayload) {
-        if let Some(player) = self.players.get_mut(addr) {
-            player.name = player_input.name;
-            player.direction = player_input.direction;
-            player.last_ping = Instant::now();
-        } else {
-            let new_player = Player {
-                id: self.next_player_id,
-                name: player_input.name,
-                position: Vec2::new(100.0, 100.0),
-                direction: player_input.direction,
-                last_ping: Instant::now(),
-            };
-            self.next_player_id += 1;
-            self.players.insert(*addr, new_player);
-            Self::connected(self.players.get(addr).unwrap());
-        }
+    fn update_or_connect_player(&mut self, addr: &SocketAddr, payload: PlayerPayload) {
+        match payload {
+            PlayerPayload::Bye => {
+                self.disconnect(addr);
+            }
+            PlayerPayload::Input(player_input_payload) => {
+                if let Some(player) = self.players.get_mut(addr) {
+                    player.name = player_input_payload.name;
+                    player.direction = player_input_payload.direction;
+                    player.last_ping = Instant::now();
+                } else {
+                    let new_player = Player {
+                        id: self.next_player_id,
+                        name: player_input_payload.name,
+                        position: Vec2::new(100.0, 100.0),
+                        direction: player_input_payload.direction,
+                        last_ping: Instant::now(),
+                    };
+                    self.next_player_id += 1;
+                    self.players.insert(*addr, new_player);
+                    Self::connected(self.players.get(addr).unwrap());
+                }
+            }
+        };
     }
 
     fn disconnect(&mut self, addr: &SocketAddr) {
@@ -145,7 +171,7 @@ impl World {
     }
 
     fn move_players(&mut self, dt: f32) {
-        for (_, player) in &mut self.players {
+        for player in self.players.values_mut() {
             player.position += player.direction.normalize_or_zero() * self.player_speed * dt;
             player.position = Vec2::new(
                 player.position.x.rem_euclid(WORLD_SIZE.x),
@@ -184,23 +210,23 @@ impl EventHandler for World {
     }
 
     fn message_received(&mut self, socket: &UdpSocket, from: &SocketAddr, message: &[u8]) {
-        let Ok(message) = str::from_utf8(&message) else {
-            _ = socket.send_to("INVALID: payload is not UTF-8\n".as_bytes(), from);
-            self.disconnect(&from);
+        let Ok(message) = str::from_utf8(message) else {
+            _ = socket.send_to("INVALID payload is not UTF-8\n".as_bytes(), from);
+            self.disconnect(from);
             return;
         };
 
-        let player_input = match PlayerInputPayload::try_from(message) {
+        let payload = match PlayerPayload::try_from(message) {
             Ok(input) => input,
             Err(err) => {
-                _ = socket.send_to(format!("INVALID: {err}\n").as_bytes(), from);
-                self.disconnect(&from);
+                _ = socket.send_to(format!("INVALID {err}\n").as_bytes(), from);
+                self.disconnect(from);
                 return;
             }
         };
 
         // Upate player
-        self.update_or_connect_player(&from, player_input);
+        self.update_or_connect_player(from, payload);
     }
 
     fn fixed_update(&mut self, socket: &UdpSocket, dt: f32) {
@@ -209,7 +235,7 @@ impl EventHandler for World {
 
         // Send
         let snapshot = self.snapshot().into_bytes();
-        for (addr, _) in &self.players {
+        for addr in self.players.keys() {
             _ = socket.send_to(&snapshot, addr);
         }
     }
