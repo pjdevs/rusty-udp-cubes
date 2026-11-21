@@ -3,7 +3,7 @@ mod shared;
 use std::{
     collections::HashMap,
     fmt::Display,
-    io::ErrorKind,
+    io::{self, ErrorKind},
     net::{SocketAddr, UdpSocket},
     num::ParseFloatError,
     time::{Duration, Instant},
@@ -136,33 +136,99 @@ impl World {
     }
 }
 
-// struct RunLoop {
-//     fixed_update_ms: u64,
-//     dt: f32,
-// }
+trait EventHandler {
+    fn listening(&mut self, local_addr: &SocketAddr);
+    fn message_received(&mut self, socket: &UdpSocket, from: &SocketAddr, message: &[u8]);
+    fn fixed_update(&mut self, socket: &UdpSocket, dt: f32);
+}
 
-// impl RunLoop {
-//     fn new(fixed_update_ms: u64) -> Self {
-//         Self {
-//             fixed_update_ms,
-//             dt: 0.0,
-//         }
-//     }
+impl EventHandler for World {
+    fn listening(&mut self, local_addr: &SocketAddr) {
+        println!("Listenning on {local_addr}");
+    }
 
-//     fn run(&mut self, loop_func: impl Fn(&mut World, &UdpSocket)) {}
-// }
+    fn message_received(&mut self, socket: &UdpSocket, from: &SocketAddr, message: &[u8]) {
+        let Ok(message) = str::from_utf8(&message) else {
+            _ = socket.send_to("INVALID: payload is not UTF-8\n".as_bytes(), from);
+            self.disconnect(&from);
+            return;
+        };
 
-// trait ServerMessaging {
-//     fn send_message_to(&self, addr: &SocketAddr, message: &String) -> io::Result<usize>;
-// }
+        let player_input = match PlayerInputPayload::try_from(message) {
+            Ok(input) => input,
+            Err(err) => {
+                _ = socket.send_to(format!("INVALID: {err}\n").as_bytes(), from);
+                self.disconnect(&from);
+                return;
+            }
+        };
 
-// impl ServerMessaging for UdpSocket {
-//     fn rcv_player_input() -> Result<PlayerInputPayload, PlayerInputParseError> {}
+        // Upate player
+        self.update_or_connect_player(&from, player_input);
+    }
 
-//     fn send_message_to(&self, addr: &SocketAddr, message: &String) -> io::Result<usize> {
-//         self.send_to(message.as_bytes(), *addr)
-//     }
-// }
+    fn fixed_update(&mut self, socket: &UdpSocket, dt: f32) {
+        // Step
+        self.step(dt);
+
+        // Send
+        let snapshot = self.snapshot().into_bytes();
+        for (addr, _) in &self.players {
+            _ = socket.send_to(&snapshot, addr);
+        }
+    }
+}
+
+fn run_udp_event_loop(
+    address: &String,
+    fixed_update_millis: u64,
+    handler: &mut impl EventHandler,
+) -> io::Result<()> {
+    // Open socket
+    let socket = UdpSocket::bind(address)?;
+    let local_addr = socket.local_addr()?;
+
+    handler.listening(&local_addr);
+
+    // Loop variables
+    let mut buffer = [0u8; 128];
+    let mut dt: f32 = 0.0;
+
+    // Loop
+    loop {
+        let tick_start_time = Instant::now();
+        let mut recv_budget = Duration::from_millis(fixed_update_millis);
+
+        // Receive loop while budget
+        while recv_budget > Duration::ZERO {
+            let timer = Instant::now();
+
+            // Receive one packet
+            socket.set_read_timeout(Some(recv_budget))?;
+            let (len, from) = match socket.recv_from(&mut buffer) {
+                Ok((len, from)) => (len, from),
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                {
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+
+            // Handle
+            handler.message_received(&socket, &from, &buffer[..len]);
+
+            // Timer
+            recv_budget -= timer.elapsed();
+        }
+
+        // Step
+        handler.fixed_update(&socket, dt);
+
+        // Delta
+        dt = tick_start_time.elapsed().as_secs_f32();
+    }
+}
 
 const PLAYER_SPEED: f32 = 250.0;
 const TICK_MILLIS: u64 = 16;
@@ -173,69 +239,6 @@ fn main() -> std::io::Result<()> {
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:4000".to_string());
 
-    // Open socket
-    let socket = UdpSocket::bind(&address)?;
-    let local_addr = socket.local_addr()?;
-    println!("Listenning on {local_addr}");
-
-    // Setup
     let mut world = World::new(PLAYER_SPEED);
-    let mut buf = [0u8; 128];
-    let mut dt: f32 = 0.0;
-
-    // Main loop
-    loop {
-        let tick_start_time = Instant::now();
-        let mut recv_budget = Duration::from_millis(TICK_MILLIS);
-
-        // Receive loop while budget
-        while recv_budget > Duration::ZERO {
-            let timer = Instant::now();
-
-            // Receive one packet
-            socket.set_read_timeout(Some(recv_budget))?;
-            let (len, from) = match socket.recv_from(&mut buf) {
-                Ok((len, from)) => (len, from),
-                Err(error)
-                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
-                {
-                    break;
-                }
-                Err(error) => return Err(error),
-            };
-
-            let Ok(message) = str::from_utf8(&buf[..len]) else {
-                socket.send_to("INVALID: payload is not UTF-8\n".as_bytes(), from)?;
-                world.disconnect(&from);
-                continue;
-            };
-
-            let player_input = match PlayerInputPayload::try_from(message) {
-                Ok(input) => input,
-                Err(err) => {
-                    socket.send_to(format!("INVALID: {err}\n").as_bytes(), from)?;
-                    world.disconnect(&from);
-                    continue;
-                }
-            };
-
-            // Upate player
-            world.update_or_connect_player(&from, player_input);
-
-            // Timer
-            recv_budget -= timer.elapsed();
-        }
-
-        // Step
-        world.step(dt);
-
-        // Send
-        let snapshot = world.snapshot().into_bytes();
-        for (addr, _) in &world.players {
-            socket.send_to(&snapshot, addr)?;
-        }
-
-        // Delta
-        dt = tick_start_time.elapsed().as_secs_f32();
-    }
+    run_udp_event_loop(&address, TICK_MILLIS, &mut world)
 }
