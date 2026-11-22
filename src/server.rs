@@ -6,7 +6,7 @@ use std::{
     fmt::Display,
     io::ErrorKind,
     net::{SocketAddr, UdpSocket},
-    sync::Mutex,
+    sync::{Mutex, mpsc::sync_channel},
     thread,
     time::{Duration, Instant},
 };
@@ -34,20 +34,20 @@ impl Display for Player {
 }
 
 enum PlayerPayloadParseError {
-    WrongFormat { len: usize },
-    WrongValues { error: String, index: usize },
+    Encoding,
+    Format { len: usize },
+    Values { error: String, index: usize },
 }
 
 impl Display for PlayerPayloadParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::WrongFormat { len } => {
-                write!(
-                    f,
-                    "Expected 3 spaced args 'name X Y' or 'bye', received {len} tokens"
-                )
-            }
-            Self::WrongValues { error, index } => {
+            Self::Encoding => write!(f, "payload is not UTF-8"),
+            Self::Format { len } => write!(
+                f,
+                "Expected 3 spaced args 'name X Y' or 'bye', received {len} tokens"
+            ),
+            Self::Values { error, index } => {
                 write!(f, "Could not parse token {index}: {error}")
             }
         }
@@ -74,7 +74,7 @@ impl TryFrom<&str> for PlayerPayload {
             return if splits[0] == "bye" {
                 Ok(PlayerPayload::Bye)
             } else {
-                Err(PlayerPayloadParseError::WrongValues {
+                Err(PlayerPayloadParseError::Values {
                     error: String::from("'bye' expected in a single token command"),
                     index: 0,
                 })
@@ -82,7 +82,7 @@ impl TryFrom<&str> for PlayerPayload {
         }
 
         if splits.len() != 3 {
-            return Err(PlayerPayloadParseError::WrongFormat { len: splits.len() });
+            return Err(PlayerPayloadParseError::Format { len: splits.len() });
         }
 
         Ok(PlayerPayload::Input(PlayerInputPayload {
@@ -90,13 +90,13 @@ impl TryFrom<&str> for PlayerPayload {
             direction: Vec2 {
                 x: splits[1]
                     .parse::<f32>()
-                    .map_err(|e| PlayerPayloadParseError::WrongValues {
+                    .map_err(|e| PlayerPayloadParseError::Values {
                         error: e.to_string(),
                         index: 1,
                     })?,
                 y: splits[2]
                     .parse::<f32>()
-                    .map_err(|e| PlayerPayloadParseError::WrongValues {
+                    .map_err(|e| PlayerPayloadParseError::Values {
                         error: e.to_string(),
                         index: 2,
                     })?,
@@ -124,13 +124,13 @@ impl World {
         }
     }
 
-    fn update_or_connect_player(&mut self, addr: &SocketAddr, payload: PlayerPayload) {
+    fn update_or_connect_player(&mut self, addr: SocketAddr, payload: PlayerPayload) {
         match payload {
             PlayerPayload::Bye => {
                 self.disconnect(addr);
             }
             PlayerPayload::Input(player_input_payload) => {
-                if let Some(player) = self.players.get_mut(addr) {
+                if let Some(player) = self.players.get_mut(&addr) {
                     player.name = player_input_payload.name;
                     player.direction = player_input_payload.direction;
                     player.last_ping = Instant::now();
@@ -143,15 +143,15 @@ impl World {
                         last_ping: Instant::now(),
                     };
                     self.next_player_id += 1;
-                    self.players.insert(*addr, new_player);
-                    Self::connected(self.players.get(addr).unwrap());
+                    self.players.insert(addr, new_player);
+                    Self::connected(self.players.get(&addr).unwrap());
                 }
             }
         };
     }
 
-    fn disconnect(&mut self, addr: &SocketAddr) {
-        if let Some(player) = self.players.remove(addr) {
+    fn disconnect(&mut self, addr: SocketAddr) {
+        if let Some(player) = self.players.remove(&addr) {
             Self::disconnected(&player);
         }
     }
@@ -201,45 +201,107 @@ impl World {
     }
 }
 
-trait EventHandler {
-    fn listening(&mut self, local_addr: &SocketAddr);
-    fn message_received(&mut self, socket: &UdpSocket, from: &SocketAddr, message: &[u8]);
-    fn fixed_update(&mut self, socket: &UdpSocket, dt: f32);
+type MessageParser<T, E> = fn(message: &[u8]) -> Result<T, E>;
+
+fn parse_message(message: &[u8]) -> Result<PlayerPayload, PlayerPayloadParseError> {
+    if let Ok(message) = str::from_utf8(message) {
+        PlayerPayload::try_from(message)
+    } else {
+        Err(PlayerPayloadParseError::Encoding)
+    }
 }
 
-impl EventHandler for World {
+enum Recipients {
+    One(SocketAddr),
+    Broadcast(usize),
+}
+
+struct MessageToSend<T> {
+    to: Recipients,
+    payload: T,
+}
+
+struct MessageBox<T> {
+    messages: Vec<MessageToSend<T>>,
+    broadcast_recipients: Vec<SocketAddr>,
+}
+
+impl<T: Into<String>> MessageBox<T> {
+    fn new() -> Self {
+        Self {
+            messages: Vec::new(),
+            broadcast_recipients: Vec::new(),
+        }
+    }
+
+    fn send_to(&mut self, to: SocketAddr, payload: T) {
+        self.messages.push(MessageToSend {
+            to: Recipients::One(to),
+            payload,
+        });
+    }
+
+    fn broadcast(&mut self, recipients: impl IntoIterator<Item = SocketAddr>, payload: T) {
+        let start = self.broadcast_recipients.len();
+        self.broadcast_recipients.extend(recipients);
+        self.messages.push(MessageToSend {
+            to: Recipients::Broadcast(self.broadcast_recipients.len() - start),
+            payload,
+        });
+    }
+
+    fn flush(&mut self, socket: &UdpSocket) {
+        let mut recipients = self.broadcast_recipients.drain(..);
+        for MessageToSend { to, payload } in self.messages.drain(..) {
+            let payload = payload.into();
+            match to {
+                Recipients::One(addr) => {
+                    _ = socket.send_to(payload.as_bytes(), addr);
+                }
+                Recipients::Broadcast(count) => {
+                    for addr in recipients.by_ref().take(count) {
+                        _ = socket.send_to(payload.as_bytes(), addr);
+                    }
+                }
+            }
+        }
+    }
+}
+
+trait EventHandler<T, E, P> {
+    fn listening(&mut self, local_addr: &SocketAddr);
+    fn handle_parse_error(&mut self, from: SocketAddr, error: &E, message_box: &mut MessageBox<P>);
+    fn handle_message(&mut self, from: SocketAddr, payload: T, message_box: &mut MessageBox<P>);
+    fn fixed_update(&mut self, dt: f32, message_box: &mut MessageBox<P>);
+}
+
+impl EventHandler<PlayerPayload, PlayerPayloadParseError, String> for World {
     fn listening(&mut self, local_addr: &SocketAddr) {
         println!("Listenning on {local_addr}");
     }
 
-    fn message_received(&mut self, socket: &UdpSocket, from: &SocketAddr, message: &[u8]) {
-        let Ok(message) = str::from_utf8(message) else {
-            _ = socket.send_to("INVALID payload is not UTF-8\n".as_bytes(), from);
-            self.disconnect(from);
-            return;
-        };
+    fn handle_parse_error(
+        &mut self,
+        from: SocketAddr,
+        error: &PlayerPayloadParseError,
+        message_box: &mut MessageBox<String>,
+    ) {
+        message_box.send_to(from, format!("INVALID {error}\n"));
+    }
 
-        let payload = match PlayerPayload::try_from(message) {
-            Ok(input) => input,
-            Err(err) => {
-                _ = socket.send_to(format!("INVALID {err}\n").as_bytes(), from);
-                self.disconnect(from);
-                return;
-            }
-        };
-
-        // Upate player
+    fn handle_message(
+        &mut self,
+        from: SocketAddr,
+        payload: PlayerPayload,
+        _message_box: &mut MessageBox<String>,
+    ) {
         self.update_or_connect_player(from, payload);
     }
 
-    fn fixed_update(&mut self, socket: &UdpSocket, dt: f32) {
-        // Step
+    fn fixed_update(&mut self, dt: f32, message_box: &mut MessageBox<String>) {
         self.step(dt);
-
-        // Send
-        let snapshot = self.snapshot().into_bytes();
-        for addr in self.players.keys() {
-            _ = socket.send_to(&snapshot, addr);
+        if !self.players.is_empty() {
+            message_box.broadcast(self.players.keys().copied(), self.snapshot());
         }
     }
 }
@@ -247,10 +309,11 @@ impl EventHandler for World {
 type ServerResult = Result<(), Box<dyn Error + Send + Sync>>;
 
 #[allow(dead_code)]
-fn run_udp_event_loop(
+fn run_udp_event_loop<T, E, P: Into<String>>(
     address: &String,
     fixed_update: Duration,
-    handler: &mut impl EventHandler,
+    parser: MessageParser<T, E>,
+    handler: &mut impl EventHandler<T, E, P>,
 ) -> ServerResult {
     // Open socket
     let socket = UdpSocket::bind(address)?;
@@ -261,6 +324,7 @@ fn run_udp_event_loop(
     // Loop variables
     let mut buffer = [0u8; 128];
     let mut dt: f32 = 0.0;
+    let mut message_box = MessageBox::new();
 
     // Loop
     loop {
@@ -283,8 +347,14 @@ fn run_udp_event_loop(
                 Err(error) => return Err(error.into()),
             };
 
+            // Parse
+            let result = parser(&buffer[..len]);
+
             // Handle
-            handler.message_received(&socket, &from, &buffer[..len]);
+            match result {
+                Ok(message) => handler.handle_message(from, message, &mut message_box),
+                Err(error) => handler.handle_parse_error(from, &error, &mut message_box),
+            };
 
             // Timer
             let elapsed = timer.elapsed();
@@ -296,17 +366,20 @@ fn run_udp_event_loop(
         }
 
         // Step
-        handler.fixed_update(&socket, dt);
+        handler.fixed_update(dt, &mut message_box);
+        message_box.flush(&socket);
 
         // Delta
         dt = tick_start_time.elapsed().as_secs_f32();
     }
 }
 
-fn run_mt_udp_event_loop(
+#[allow(dead_code)]
+fn run_mt_udp_event_loop<T, E, P: Into<String> + Send>(
     address: &String,
     fixed_update: Duration,
-    mut handler: impl EventHandler + Send,
+    parser: MessageParser<T, E>,
+    mut handler: impl EventHandler<T, E, P> + Send,
 ) -> ServerResult {
     // Socket
     let socket = UdpSocket::bind(address)?;
@@ -314,7 +387,7 @@ fn run_mt_udp_event_loop(
 
     handler.listening(&local_addr);
 
-    let handler_lock = Mutex::new(handler);
+    let handler_lock = Mutex::new((handler, MessageBox::new()));
 
     thread::scope(|scope| {
         // Receive thread: its only way out is an I/O error, carried by `?`
@@ -323,11 +396,16 @@ fn run_mt_udp_event_loop(
 
             loop {
                 let (len, from) = socket.recv_from(&mut buffer)?;
+                let result = parser(&buffer[..len]);
+
                 // A poisoned lock means the other thread panicked: panic too
-                handler_lock
-                    .lock()
-                    .unwrap()
-                    .message_received(&socket, &from, &buffer[..len]);
+                let mut state = handler_lock.lock().unwrap();
+                let (handler, message_box) = &mut *state;
+
+                match result {
+                    Ok(message) => handler.handle_message(from, message, message_box),
+                    Err(error) => handler.handle_parse_error(from, &error, message_box),
+                };
             }
         });
 
@@ -335,12 +413,89 @@ fn run_mt_udp_event_loop(
         let mut dt: f32 = 0.0;
 
         while !recv_thread.is_finished() {
-            let start_time = Instant::now();
+            let tick_start_time = Instant::now();
 
             thread::sleep(fixed_update);
-            handler_lock.lock().unwrap().fixed_update(&socket, dt);
+            let mut state = handler_lock.lock().unwrap();
+            let (handler, message_box) = &mut *state;
+            handler.fixed_update(dt, message_box);
+            message_box.flush(&socket);
 
-            dt = start_time.elapsed().as_secs_f32();
+            dt = tick_start_time.elapsed().as_secs_f32();
+        }
+
+        // Hand back the receive thread's error, or its panic
+        recv_thread
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
+struct ReceivedMessage<T, E> {
+    from: SocketAddr,
+    parse_result: Result<T, E>,
+}
+
+fn run_channel_udp_event_loop<T: Send, E: Send, P: Into<String>>(
+    address: &String,
+    fixed_update: Duration,
+    max_channel_message_count: usize,
+    parser: MessageParser<T, E>,
+    mut handler: impl EventHandler<T, E, P>,
+) -> ServerResult {
+    // Socket
+    let socket = UdpSocket::bind(address)?;
+    let local_addr = socket.local_addr()?;
+
+    handler.listening(&local_addr);
+
+    let (sender, receiver) = sync_channel(max_channel_message_count);
+    let mut message_box = MessageBox::new();
+
+    thread::scope(|scope| {
+        // Receive thread: its only way out is an I/O error, carried by `?`
+        let recv_thread = scope.spawn(|| -> ServerResult {
+            let mut buffer = [0u8; 1024];
+
+            loop {
+                let (len, from) = socket.recv_from(&mut buffer)?;
+                let parse_result = parser(&buffer[..len]);
+                if sender.send(ReceivedMessage { from, parse_result }).is_err() {
+                    return Ok(());
+                }
+            }
+        });
+
+        // Fixed update, on this thread, for as long as the receive thread lives
+        let mut dt: f32 = 0.0;
+
+        // Loop
+        while !recv_thread.is_finished() {
+            let tick_start_time = Instant::now();
+
+            // Receive loop
+            for message in receiver.try_iter() {
+                match message.parse_result {
+                    Ok(payload) => handler.handle_message(message.from, payload, &mut message_box),
+                    Err(error) => {
+                        handler.handle_parse_error(message.from, &error, &mut message_box)
+                    }
+                }
+            }
+
+            // Step
+            handler.fixed_update(dt, &mut message_box);
+            message_box.flush(&socket);
+
+            // Sleep
+            let world_duration = tick_start_time.elapsed();
+            if world_duration < fixed_update {
+                thread::sleep(fixed_update - world_duration);
+            }
+
+            // Delta
+            dt = tick_start_time.elapsed().as_secs_f32();
+            println!("{:.0}", 1.0 / dt);
         }
 
         // Hand back the receive thread's error, or its panic
@@ -353,6 +508,7 @@ fn run_mt_udp_event_loop(
 const PLAYER_SPEED: f32 = 250.0;
 const PLAYERS_TTL: Duration = Duration::from_millis(5000);
 const TICK_INTERVAL: Duration = Duration::from_millis(16);
+const MAX_CHANNEL_MESSAGE_COUNT: usize = 4096;
 
 fn main() -> ServerResult {
     // Params
@@ -361,5 +517,11 @@ fn main() -> ServerResult {
         .unwrap_or_else(|| "127.0.0.1:4000".to_string());
 
     let world = World::new(PLAYER_SPEED, PLAYERS_TTL);
-    run_mt_udp_event_loop(&address, TICK_INTERVAL, world)
+    run_channel_udp_event_loop(
+        &address,
+        TICK_INTERVAL,
+        MAX_CHANNEL_MESSAGE_COUNT,
+        parse_message,
+        world,
+    )
 }
