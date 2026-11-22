@@ -20,7 +20,7 @@ struct Player {
     name: String,
     position: Vec2,
     direction: Vec2,
-    last_ping: Instant,
+    last_ping: f32,
 }
 
 impl Display for Player {
@@ -107,38 +107,26 @@ impl TryFrom<&str> for PlayerPayload {
     }
 }
 
-trait Clock {
-    fn now(&self) -> Instant;
-}
-
-struct TimeClock;
-
-impl Clock for TimeClock {
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
-}
-
-struct World<C: Clock> {
+struct World {
     players: HashMap<SocketAddr, Player>,
     next_player_id: u64,
     player_speed: f32,
-    players_ttl: Duration,
+    players_ttl: f32,
     ticks: u64,
-    clock: C,
+    elapsed: f32,
 }
 
-impl<C: Clock> World<C> {
+impl World {
     const MAX_PLAYER_NAME_LENGTH: usize = 128;
 
-    fn new(player_speed: f32, players_ttl: Duration, clock: C) -> Self {
+    fn new(player_speed: f32, players_ttl: Duration) -> Self {
         Self {
             players: HashMap::new(),
             next_player_id: 0,
             player_speed,
-            players_ttl,
+            players_ttl: players_ttl.as_secs_f32(),
             ticks: 0,
-            clock,
+            elapsed: 0.0,
         }
     }
 
@@ -155,7 +143,7 @@ impl<C: Clock> World<C> {
                 if let Some(player) = self.players.get_mut(&addr) {
                     player.name = player_input_payload.name;
                     player.direction = player_input_payload.direction;
-                    player.last_ping = self.clock.now();
+                    player.last_ping = self.elapsed;
                 } else {
                     let step = (self.next_player_id + 1) as f32;
                     let new_player = Player {
@@ -163,7 +151,7 @@ impl<C: Clock> World<C> {
                         name: player_input_payload.name,
                         position: Vec2::new(70.0 * step, 100.0 * step),
                         direction: player_input_payload.direction,
-                        last_ping: self.clock.now(),
+                        last_ping: self.elapsed,
                     };
                     self.next_player_id += 1;
                     self.players.insert(addr, new_player);
@@ -181,7 +169,7 @@ impl<C: Clock> World<C> {
 
     fn disconnect_expired_players(&mut self) {
         for (_, player) in self.players.extract_if(|_, player| {
-            self.clock.now().duration_since(player.last_ping) > self.players_ttl
+            self.elapsed - player.last_ping > self.players_ttl
         }) {
             Self::disconnected(&player);
         }
@@ -206,6 +194,7 @@ impl<C: Clock> World<C> {
     }
 
     fn step(&mut self, dt: f32) {
+        self.elapsed += dt;
         self.disconnect_expired_players();
         self.move_players(dt);
         self.ticks += 1;
@@ -297,7 +286,7 @@ trait EventHandler<T, E, P> {
     fn fixed_update(&mut self, dt: f32, message_box: &mut MessageBox<P>);
 }
 
-impl<C: Clock> EventHandler<PlayerPayload, PlayerPayloadParseError, String> for World<C> {
+impl EventHandler<PlayerPayload, PlayerPayloadParseError, String> for World {
     fn listening(&mut self, local_addr: &SocketAddr) {
         println!("Listenning on {local_addr}");
     }
@@ -538,7 +527,7 @@ fn main() -> ServerResult {
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:4000".to_string());
 
-    let world = World::new(PLAYER_SPEED, PLAYERS_TTL, TimeClock);
+    let world = World::new(PLAYER_SPEED, PLAYERS_TTL);
     run_channel_udp_event_loop(
         &address,
         TICK_INTERVAL,
@@ -553,44 +542,19 @@ mod tests {
     use ggez::glam::Vec2;
 
     use crate::{
-        Clock, EventHandler, MessageBox, PLAYER_SPEED, PLAYERS_TTL, PlayerInputPayload,
+        EventHandler, MessageBox, PLAYER_SPEED, PLAYERS_TTL, PlayerInputPayload,
         PlayerPayload, PlayerPayloadParseError, Recipients, World, parse_message,
     };
-    use std::{
-        net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-        time::{Duration, Instant},
-    };
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
     const CLIENT_1: SocketAddr =
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 6345));
     const CLIENT_2: SocketAddr =
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 6543));
 
-    struct FakeClock {
-        current: Instant,
-    }
-
-    impl Clock for FakeClock {
-        fn now(&self) -> Instant {
-            self.current
-        }
-    }
-
-    impl FakeClock {
-        fn new() -> Self {
-            Self {
-                current: Instant::now(),
-            }
-        }
-
-        fn advance(&mut self, duration: Duration) {
-            self.current += duration;
-        }
-    }
-
     #[test]
     fn test_world_shorten_names() {
-        let mut world = World::new(PLAYER_SPEED, PLAYERS_TTL, FakeClock::new());
+        let mut world = World::new(PLAYER_SPEED, PLAYERS_TTL);
         let mut message_box = MessageBox::new();
         let very_long_name = vec!["a"; 2000].join("");
 
@@ -609,7 +573,7 @@ mod tests {
 
     #[test]
     fn test_world_broadcast() {
-        let mut world = World::new(PLAYER_SPEED, PLAYERS_TTL, FakeClock::new());
+        let mut world = World::new(PLAYER_SPEED, PLAYERS_TTL);
         let mut message_box = MessageBox::new();
 
         world.handle_message(
@@ -640,7 +604,7 @@ mod tests {
 
     #[test]
     fn test_world_forget() {
-        let mut world = World::new(PLAYER_SPEED, PLAYERS_TTL, FakeClock::new());
+        let mut world = World::new(PLAYER_SPEED, PLAYERS_TTL);
         let mut message_box = MessageBox::new();
 
         world.handle_message(
@@ -652,8 +616,7 @@ mod tests {
             &mut message_box,
         );
 
-        world.clock.advance(Duration::from_secs_f32(10.0));
-        world.fixed_update(10.0, &mut message_box);
+        world.fixed_update(PLAYERS_TTL.as_secs_f32() + 1.0, &mut message_box);
 
         assert_eq!(world.players.len(), 0);
     }
