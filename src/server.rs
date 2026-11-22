@@ -168,9 +168,10 @@ impl World {
     }
 
     fn disconnect_expired_players(&mut self) {
-        for (_, player) in self.players.extract_if(|_, player| {
-            self.elapsed - player.last_ping > self.players_ttl
-        }) {
+        for (_, player) in self
+            .players
+            .extract_if(|_, player| self.elapsed - player.last_ping > self.players_ttl)
+        {
             Self::disconnected(&player);
         }
     }
@@ -507,7 +508,6 @@ fn run_channel_udp_event_loop<T: Send, E: Send, P: Into<String>>(
 
             // Delta
             dt = tick_start_time.elapsed();
-            println!("{:.0}", 1.0 / dt.as_secs_f64());
         }
 
         // Hand back the receive thread's error, or its panic
@@ -543,8 +543,8 @@ mod tests {
     use ggez::glam::Vec2;
 
     use crate::{
-        EventHandler, MessageBox, PLAYER_SPEED, PLAYERS_TTL, PlayerInputPayload,
-        PlayerPayload, PlayerPayloadParseError, Recipients, World, parse_message,
+        EventHandler, MessageBox, PLAYER_SPEED, PLAYERS_TTL, PlayerInputPayload, PlayerPayload,
+        PlayerPayloadParseError, Recipients, World, parse_message,
     };
     use std::{
         net::{Ipv4Addr, SocketAddr, SocketAddrV4},
