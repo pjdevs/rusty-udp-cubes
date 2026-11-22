@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     error::Error,
     fmt::Display,
-    io::{self, ErrorKind},
+    io::ErrorKind,
     net::{SocketAddr, UdpSocket},
     sync::Mutex,
     thread,
@@ -244,12 +244,14 @@ impl EventHandler for World {
     }
 }
 
+type ServerResult = Result<(), Box<dyn Error + Send + Sync>>;
+
 #[allow(dead_code)]
 fn run_udp_event_loop(
     address: &String,
     fixed_update: Duration,
     handler: &mut impl EventHandler,
-) -> io::Result<()> {
+) -> ServerResult {
     // Open socket
     let socket = UdpSocket::bind(address)?;
     let local_addr = socket.local_addr()?;
@@ -278,7 +280,7 @@ fn run_udp_event_loop(
                 {
                     break;
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             };
 
             // Handle
@@ -300,8 +302,6 @@ fn run_udp_event_loop(
         dt = tick_start_time.elapsed().as_secs_f32();
     }
 }
-
-type ServerResult = Result<(), Box<dyn Error + Send + Sync>>;
 
 fn run_mt_udp_event_loop(
     address: &String,
