@@ -130,10 +130,12 @@ impl World {
         }
     }
 
-    fn update_or_connect_player(&mut self, addr: SocketAddr, payload: PlayerPayload) {
+    /// Update or create player, returning true if a player was created
+    fn update_or_connect_player(&mut self, addr: SocketAddr, payload: PlayerPayload) -> bool {
         match payload {
             PlayerPayload::Bye => {
                 self.disconnect(addr);
+                false
             }
             PlayerPayload::Input(player_input_payload) => {
                 let safe_name: String = player_input_payload
@@ -146,6 +148,7 @@ impl World {
                     player.name = safe_name;
                     player.direction = player_input_payload.direction;
                     player.last_ping = self.elapsed;
+                    false
                 } else {
                     let step = (self.next_player_id + 1) as f32;
                     let new_player = Player {
@@ -158,9 +161,10 @@ impl World {
                     self.next_player_id += 1;
                     self.players.insert(addr, new_player);
                     Self::connected(self.players.get(&addr).unwrap());
+                    true
                 }
             }
-        };
+        }
     }
 
     fn disconnect(&mut self, addr: SocketAddr) {
@@ -293,7 +297,8 @@ trait EventHandler<T, E, P> {
     fn listening(&mut self, local_addr: &SocketAddr);
     fn handle_parse_error(&mut self, from: SocketAddr, error: &E, message_box: &mut MessageBox<P>);
     fn handle_message(&mut self, from: SocketAddr, payload: T, message_box: &mut MessageBox<P>);
-    fn fixed_update(&mut self, dt: Duration, message_box: &mut MessageBox<P>);
+    fn update(&mut self, dt: Duration);
+    fn send(&self, message_box: &mut MessageBox<P>);
 }
 
 impl EventHandler<PlayerPayload, PlayerPayloadParseError, String> for World {
@@ -316,13 +321,16 @@ impl EventHandler<PlayerPayload, PlayerPayloadParseError, String> for World {
         payload: PlayerPayload,
         message_box: &mut MessageBox<String>,
     ) {
-        self.update_or_connect_player(from, payload);
-        self.notify_you(from, message_box);
+        if self.update_or_connect_player(from, payload) {
+            self.notify_you(from, message_box);
+        }
     }
 
-    fn fixed_update(&mut self, dt: Duration, message_box: &mut MessageBox<String>) {
+    fn update(&mut self, dt: Duration) {
         self.step(dt);
+    }
 
+    fn send(&self, message_box: &mut MessageBox<String>) {
         if !self.players.is_empty() {
             message_box.broadcast(self.players.keys().copied(), self.snapshot());
 
@@ -393,7 +401,8 @@ fn run_udp_event_loop<T, E, P: Into<String>>(
         }
 
         // Step
-        handler.fixed_update(dt, &mut message_box);
+        handler.update(dt);
+        handler.send(&mut message_box);
         message_box.flush(&socket);
 
         // Delta
@@ -445,7 +454,8 @@ fn run_mt_udp_event_loop<T, E, P: Into<String> + Send>(
             thread::sleep(fixed_update);
             let mut state = handler_lock.lock().unwrap();
             let (handler, message_box) = &mut *state;
-            handler.fixed_update(dt, message_box);
+            handler.update(dt);
+            handler.send(message_box);
             message_box.flush(&socket);
 
             dt = tick_start_time.elapsed();
@@ -493,15 +503,16 @@ fn run_channel_udp_event_loop<T: Send, E: Send, P: Into<String>>(
             }
         });
 
-        // Fixed update, on this thread, for as long as the receive thread lives
-        let mut dt = Duration::ZERO;
+        let mut previous_turn = Instant::now();
+        let mut accumulator = Duration::ZERO;
 
-        // Loop
         while !recv_thread.is_finished() {
-            let tick_start_time = Instant::now();
+            let turn_start = Instant::now();
+            accumulator += (turn_start - previous_turn).min(MAX_CATCH_UP_TIME);
+            previous_turn = turn_start;
 
-            // Receive loop
-            for message in receiver.try_iter() {
+            // Bound the receive work so a busy channel can't starve the simulation.
+            for message in receiver.try_iter().take(max_channel_message_count.max(1)) {
                 match message.parse_result {
                     Ok(payload) => handler.handle_message(message.from, payload, &mut message_box),
                     Err(error) => {
@@ -510,18 +521,19 @@ fn run_channel_udp_event_loop<T: Send, E: Send, P: Into<String>>(
                 }
             }
 
-            // Step
-            handler.fixed_update(dt, &mut message_box);
+            if accumulator >= fixed_update {
+                while accumulator >= fixed_update {
+                    handler.update(fixed_update);
+                    accumulator -= fixed_update;
+                }
+                handler.send(&mut message_box);
+            }
             message_box.flush(&socket);
 
-            // Sleep
-            let world_duration = tick_start_time.elapsed();
-            if world_duration < fixed_update {
-                thread::sleep(fixed_update - world_duration);
+            let sleep_for = (fixed_update - accumulator).saturating_sub(turn_start.elapsed());
+            if !sleep_for.is_zero() {
+                thread::sleep(sleep_for);
             }
-
-            // Delta
-            dt = tick_start_time.elapsed();
         }
 
         // Hand back the receive thread's error, or its panic
@@ -534,6 +546,7 @@ fn run_channel_udp_event_loop<T: Send, E: Send, P: Into<String>>(
 const PLAYER_SPEED: f32 = 250.0;
 const PLAYERS_TTL: Duration = Duration::from_millis(5000);
 const TICK_INTERVAL: Duration = Duration::from_millis(16);
+const MAX_CATCH_UP_TIME: Duration = Duration::from_millis(250);
 const MAX_CHANNEL_MESSAGE_COUNT: usize = 4096;
 
 fn main() -> ServerResult {
@@ -586,7 +599,6 @@ mod tests {
         );
 
         assert!(world.players[&CLIENT_1].name.len() < very_long_name.len());
-        assert_eq!(message_box.messages.len(), 0);
     }
 
     #[test]
@@ -611,13 +623,18 @@ mod tests {
             &mut message_box,
         );
 
-        world.fixed_update(Duration::from_millis(1), &mut message_box);
+        world.update(Duration::from_millis(1));
+        world.send(&mut message_box);
 
-        assert_eq!(message_box.messages.len(), 1);
-        assert!(matches!(
-            message_box.messages[0].to,
-            Recipients::Broadcast(r) if r == 2
-        ))
+        let mut broadcasts = message_box
+            .messages
+            .iter()
+            .filter_map(|message| match message.to {
+                Recipients::Broadcast(count) => Some(count),
+                Recipients::One(_) => None,
+            });
+        assert_eq!(broadcasts.next(), Some(2));
+        assert_eq!(broadcasts.next(), None);
     }
 
     #[test]
@@ -634,7 +651,7 @@ mod tests {
             &mut message_box,
         );
 
-        world.fixed_update(PLAYERS_TTL + Duration::from_nanos(1), &mut message_box);
+        world.update(PLAYERS_TTL + Duration::from_nanos(1));
 
         assert_eq!(world.players.len(), 0);
     }
