@@ -214,6 +214,12 @@ impl World {
                 .join("\n")
             + "\n"
     }
+
+    fn notify_you(&self, addr: SocketAddr, message_box: &mut MessageBox<String>) {
+        if let Some(player) = self.players.get(&addr) {
+            message_box.send_to(addr, format!("YOU {}\n", player.id));
+        }
+    }
 }
 
 type MessageParser<T, E> = fn(message: &[u8]) -> Result<T, E>;
@@ -308,15 +314,21 @@ impl EventHandler<PlayerPayload, PlayerPayloadParseError, String> for World {
         &mut self,
         from: SocketAddr,
         payload: PlayerPayload,
-        _message_box: &mut MessageBox<String>,
+        message_box: &mut MessageBox<String>,
     ) {
         self.update_or_connect_player(from, payload);
+        self.notify_you(from, message_box);
     }
 
     fn fixed_update(&mut self, dt: Duration, message_box: &mut MessageBox<String>) {
         self.step(dt);
+
         if !self.players.is_empty() {
             message_box.broadcast(self.players.keys().copied(), self.snapshot());
+
+            for addr in self.players.keys() {
+                self.notify_you(*addr, message_box);
+            }
         }
     }
 }
