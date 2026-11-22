@@ -136,19 +136,21 @@ impl World {
                 self.disconnect(addr);
             }
             PlayerPayload::Input(mut player_input_payload) => {
-                player_input_payload
+                let safe_name: String = player_input_payload
                     .name
-                    .truncate(Self::MAX_PLAYER_NAME_LENGTH);
+                    .chars()
+                    .take(Self::MAX_PLAYER_NAME_LENGTH)
+                    .collect();
 
                 if let Some(player) = self.players.get_mut(&addr) {
-                    player.name = player_input_payload.name;
+                    player.name = safe_name;
                     player.direction = player_input_payload.direction;
                     player.last_ping = self.elapsed;
                 } else {
                     let step = (self.next_player_id + 1) as f32;
                     let new_player = Player {
                         id: self.next_player_id,
-                        name: player_input_payload.name,
+                        name: safe_name,
                         position: Vec2::new(70.0 * step, 100.0 * step),
                         direction: player_input_payload.direction,
                         last_ping: self.elapsed,
