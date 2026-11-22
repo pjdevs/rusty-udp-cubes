@@ -54,11 +54,13 @@ impl Display for PlayerPayloadParseError {
     }
 }
 
+#[derive(Debug)]
 enum PlayerPayload {
     Bye,
     Input(PlayerInputPayload),
 }
 
+#[derive(Debug)]
 struct PlayerInputPayload {
     name: String,
     direction: Vec2,
@@ -105,24 +107,38 @@ impl TryFrom<&str> for PlayerPayload {
     }
 }
 
-struct World {
+trait Clock {
+    fn now(&self) -> Instant;
+}
+
+struct TimeClock;
+
+impl Clock for TimeClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+struct World<C: Clock> {
     players: HashMap<SocketAddr, Player>,
     next_player_id: u64,
     player_speed: f32,
     players_ttl: Duration,
     ticks: u64,
+    clock: C,
 }
 
-impl World {
+impl<C: Clock> World<C> {
     const MAX_PLAYER_NAME_LENGTH: usize = 128;
 
-    fn new(player_speed: f32, players_ttl: Duration) -> Self {
+    fn new(player_speed: f32, players_ttl: Duration, clock: C) -> Self {
         Self {
             players: HashMap::new(),
             next_player_id: 0,
             player_speed,
             players_ttl,
             ticks: 0,
+            clock,
         }
     }
 
@@ -139,7 +155,7 @@ impl World {
                 if let Some(player) = self.players.get_mut(&addr) {
                     player.name = player_input_payload.name;
                     player.direction = player_input_payload.direction;
-                    player.last_ping = Instant::now();
+                    player.last_ping = self.clock.now();
                 } else {
                     let step = (self.next_player_id + 1) as f32;
                     let new_player = Player {
@@ -147,7 +163,7 @@ impl World {
                         name: player_input_payload.name,
                         position: Vec2::new(70.0 * step, 100.0 * step),
                         direction: player_input_payload.direction,
-                        last_ping: Instant::now(),
+                        last_ping: self.clock.now(),
                     };
                     self.next_player_id += 1;
                     self.players.insert(addr, new_player);
@@ -164,10 +180,9 @@ impl World {
     }
 
     fn disconnect_expired_players(&mut self) {
-        for (_, player) in self
-            .players
-            .extract_if(|_, player| player.last_ping.elapsed() > self.players_ttl)
-        {
+        for (_, player) in self.players.extract_if(|_, player| {
+            self.clock.now().duration_since(player.last_ping) > self.players_ttl
+        }) {
             Self::disconnected(&player);
         }
     }
@@ -282,7 +297,7 @@ trait EventHandler<T, E, P> {
     fn fixed_update(&mut self, dt: f32, message_box: &mut MessageBox<P>);
 }
 
-impl EventHandler<PlayerPayload, PlayerPayloadParseError, String> for World {
+impl<C: Clock> EventHandler<PlayerPayload, PlayerPayloadParseError, String> for World<C> {
     fn listening(&mut self, local_addr: &SocketAddr) {
         println!("Listenning on {local_addr}");
     }
@@ -523,7 +538,7 @@ fn main() -> ServerResult {
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:4000".to_string());
 
-    let world = World::new(PLAYER_SPEED, PLAYERS_TTL);
+    let world = World::new(PLAYER_SPEED, PLAYERS_TTL, TimeClock);
     run_channel_udp_event_loop(
         &address,
         TICK_INTERVAL,
@@ -531,4 +546,128 @@ fn main() -> ServerResult {
         parse_message,
         world,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use ggez::glam::Vec2;
+
+    use crate::{
+        Clock, EventHandler, MessageBox, PLAYER_SPEED, PLAYERS_TTL, PlayerInputPayload,
+        PlayerPayload, PlayerPayloadParseError, Recipients, World, parse_message,
+    };
+    use std::{
+        net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+        time::{Duration, Instant},
+    };
+
+    const CLIENT_1: SocketAddr =
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 6345));
+    const CLIENT_2: SocketAddr =
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 6543));
+
+    struct FakeClock {
+        current: Instant,
+    }
+
+    impl Clock for FakeClock {
+        fn now(&self) -> Instant {
+            self.current
+        }
+    }
+
+    impl FakeClock {
+        fn new() -> Self {
+            Self {
+                current: Instant::now(),
+            }
+        }
+
+        fn advance(&mut self, duration: Duration) {
+            self.current += duration;
+        }
+    }
+
+    #[test]
+    fn test_world_shorten_names() {
+        let mut world = World::new(PLAYER_SPEED, PLAYERS_TTL, FakeClock::new());
+        let mut message_box = MessageBox::new();
+        let very_long_name = vec!["a"; 2000].join("");
+
+        world.handle_message(
+            CLIENT_1,
+            PlayerPayload::Input(PlayerInputPayload {
+                name: very_long_name.clone(),
+                direction: Vec2::ONE,
+            }),
+            &mut message_box,
+        );
+
+        assert!(world.players[&CLIENT_1].name.len() < very_long_name.len());
+        assert_eq!(message_box.messages.len(), 0);
+    }
+
+    #[test]
+    fn test_world_broadcast() {
+        let mut world = World::new(PLAYER_SPEED, PLAYERS_TTL, FakeClock::new());
+        let mut message_box = MessageBox::new();
+
+        world.handle_message(
+            CLIENT_1,
+            PlayerPayload::Input(PlayerInputPayload {
+                name: "1".into(),
+                direction: Vec2::ONE,
+            }),
+            &mut message_box,
+        );
+        world.handle_message(
+            CLIENT_2,
+            PlayerPayload::Input(PlayerInputPayload {
+                name: "2".into(),
+                direction: Vec2::X,
+            }),
+            &mut message_box,
+        );
+
+        world.fixed_update(0.001, &mut message_box);
+
+        assert_eq!(message_box.messages.len(), 1);
+        assert!(matches!(
+            message_box.messages[0].to,
+            Recipients::Broadcast(r) if r == 2
+        ))
+    }
+
+    #[test]
+    fn test_world_forget() {
+        let mut world = World::new(PLAYER_SPEED, PLAYERS_TTL, FakeClock::new());
+        let mut message_box = MessageBox::new();
+
+        world.handle_message(
+            CLIENT_1,
+            PlayerPayload::Input(PlayerInputPayload {
+                name: "1".into(),
+                direction: Vec2::ONE,
+            }),
+            &mut message_box,
+        );
+
+        world.clock.advance(Duration::from_secs_f32(10.0));
+        world.fixed_update(10.0, &mut message_box);
+
+        assert_eq!(world.players.len(), 0);
+    }
+
+    #[test]
+    fn test_parser_invalid_malformed_payload() {
+        let message = "alice 1 u".as_bytes();
+
+        let result = parse_message(message);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            PlayerPayloadParseError::Values { index: 2, .. }
+        ));
+    }
 }
