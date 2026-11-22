@@ -135,7 +135,7 @@ impl World {
             PlayerPayload::Bye => {
                 self.disconnect(addr);
             }
-            PlayerPayload::Input(mut player_input_payload) => {
+            PlayerPayload::Input(player_input_payload) => {
                 let safe_name: String = player_input_payload
                     .name
                     .chars()
