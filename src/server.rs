@@ -141,10 +141,11 @@ impl World {
                     player.direction = player_input_payload.direction;
                     player.last_ping = Instant::now();
                 } else {
+                    let step = (self.next_player_id + 1) as f32;
                     let new_player = Player {
                         id: self.next_player_id,
                         name: player_input_payload.name,
-                        position: Vec2::new(100.0, 100.0),
+                        position: Vec2::new(70.0 * step, 100.0 * step),
                         direction: player_input_payload.direction,
                         last_ping: Instant::now(),
                     };
