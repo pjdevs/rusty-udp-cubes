@@ -20,7 +20,7 @@ struct Player {
     name: String,
     position: Vec2,
     direction: Vec2,
-    last_ping: f32,
+    last_ping: Duration,
 }
 
 impl Display for Player {
@@ -111,9 +111,9 @@ struct World {
     players: HashMap<SocketAddr, Player>,
     next_player_id: u64,
     player_speed: f32,
-    players_ttl: f32,
+    players_ttl: Duration,
     ticks: u64,
-    elapsed: f32,
+    elapsed: Duration,
 }
 
 impl World {
@@ -124,9 +124,9 @@ impl World {
             players: HashMap::new(),
             next_player_id: 0,
             player_speed,
-            players_ttl: players_ttl.as_secs_f32(),
+            players_ttl,
             ticks: 0,
-            elapsed: 0.0,
+            elapsed: Duration::ZERO,
         }
     }
 
@@ -183,9 +183,10 @@ impl World {
         println!("INFO: Disconnected player {player}");
     }
 
-    fn move_players(&mut self, dt: f32) {
+    fn move_players(&mut self, dt: Duration) {
+        let distance = self.player_speed * dt.as_secs_f32();
         for player in self.players.values_mut() {
-            player.position += player.direction.normalize_or_zero() * self.player_speed * dt;
+            player.position += player.direction.normalize_or_zero() * distance;
             player.position = Vec2::new(
                 player.position.x.rem_euclid(WORLD_SIZE.x),
                 player.position.y.rem_euclid(WORLD_SIZE.y),
@@ -193,7 +194,7 @@ impl World {
         }
     }
 
-    fn step(&mut self, dt: f32) {
+    fn step(&mut self, dt: Duration) {
         self.elapsed += dt;
         self.disconnect_expired_players();
         self.move_players(dt);
@@ -283,7 +284,7 @@ trait EventHandler<T, E, P> {
     fn listening(&mut self, local_addr: &SocketAddr);
     fn handle_parse_error(&mut self, from: SocketAddr, error: &E, message_box: &mut MessageBox<P>);
     fn handle_message(&mut self, from: SocketAddr, payload: T, message_box: &mut MessageBox<P>);
-    fn fixed_update(&mut self, dt: f32, message_box: &mut MessageBox<P>);
+    fn fixed_update(&mut self, dt: Duration, message_box: &mut MessageBox<P>);
 }
 
 impl EventHandler<PlayerPayload, PlayerPayloadParseError, String> for World {
@@ -309,7 +310,7 @@ impl EventHandler<PlayerPayload, PlayerPayloadParseError, String> for World {
         self.update_or_connect_player(from, payload);
     }
 
-    fn fixed_update(&mut self, dt: f32, message_box: &mut MessageBox<String>) {
+    fn fixed_update(&mut self, dt: Duration, message_box: &mut MessageBox<String>) {
         self.step(dt);
         if !self.players.is_empty() {
             message_box.broadcast(self.players.keys().copied(), self.snapshot());
@@ -334,7 +335,7 @@ fn run_udp_event_loop<T, E, P: Into<String>>(
 
     // Loop variables
     let mut buffer = [0u8; 128];
-    let mut dt: f32 = 0.0;
+    let mut dt = Duration::ZERO;
     let mut message_box = MessageBox::new();
 
     // Loop
@@ -381,7 +382,7 @@ fn run_udp_event_loop<T, E, P: Into<String>>(
         message_box.flush(&socket);
 
         // Delta
-        dt = tick_start_time.elapsed().as_secs_f32();
+        dt = tick_start_time.elapsed();
     }
 }
 
@@ -421,7 +422,7 @@ fn run_mt_udp_event_loop<T, E, P: Into<String> + Send>(
         });
 
         // Fixed update, on this thread, for as long as the receive thread lives
-        let mut dt: f32 = 0.0;
+        let mut dt = Duration::ZERO;
 
         while !recv_thread.is_finished() {
             let tick_start_time = Instant::now();
@@ -432,7 +433,7 @@ fn run_mt_udp_event_loop<T, E, P: Into<String> + Send>(
             handler.fixed_update(dt, message_box);
             message_box.flush(&socket);
 
-            dt = tick_start_time.elapsed().as_secs_f32();
+            dt = tick_start_time.elapsed();
         }
 
         // Hand back the receive thread's error, or its panic
@@ -478,7 +479,7 @@ fn run_channel_udp_event_loop<T: Send, E: Send, P: Into<String>>(
         });
 
         // Fixed update, on this thread, for as long as the receive thread lives
-        let mut dt: f32 = 0.0;
+        let mut dt = Duration::ZERO;
 
         // Loop
         while !recv_thread.is_finished() {
@@ -505,8 +506,8 @@ fn run_channel_udp_event_loop<T: Send, E: Send, P: Into<String>>(
             }
 
             // Delta
-            dt = tick_start_time.elapsed().as_secs_f32();
-            println!("{:.0}", 1.0 / dt);
+            dt = tick_start_time.elapsed();
+            println!("{:.0}", 1.0 / dt.as_secs_f64());
         }
 
         // Hand back the receive thread's error, or its panic
@@ -545,7 +546,10 @@ mod tests {
         EventHandler, MessageBox, PLAYER_SPEED, PLAYERS_TTL, PlayerInputPayload,
         PlayerPayload, PlayerPayloadParseError, Recipients, World, parse_message,
     };
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::{
+        net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+        time::Duration,
+    };
 
     const CLIENT_1: SocketAddr =
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 6345));
@@ -593,7 +597,7 @@ mod tests {
             &mut message_box,
         );
 
-        world.fixed_update(0.001, &mut message_box);
+        world.fixed_update(Duration::from_millis(1), &mut message_box);
 
         assert_eq!(message_box.messages.len(), 1);
         assert!(matches!(
@@ -616,7 +620,7 @@ mod tests {
             &mut message_box,
         );
 
-        world.fixed_update(PLAYERS_TTL.as_secs_f32() + 1.0, &mut message_box);
+        world.fixed_update(PLAYERS_TTL + Duration::from_nanos(1), &mut message_box);
 
         assert_eq!(world.players.len(), 0);
     }
