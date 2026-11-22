@@ -2,9 +2,12 @@ mod shared;
 
 use std::{
     collections::HashMap,
+    error::Error,
     fmt::Display,
     io::{self, ErrorKind},
     net::{SocketAddr, UdpSocket},
+    sync::Mutex,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -163,11 +166,11 @@ impl World {
     }
 
     fn connected(player: &Player) {
-        println!("Connected player {player}");
+        println!("INFO: Connected player {player}");
     }
 
     fn disconnected(player: &Player) {
-        println!("Disconnected player {player}");
+        println!("INFO: Disconnected player {player}");
     }
 
     fn move_players(&mut self, dt: f32) {
@@ -241,6 +244,7 @@ impl EventHandler for World {
     }
 }
 
+#[allow(dead_code)]
 fn run_udp_event_loop(
     address: &String,
     fixed_update: Duration,
@@ -297,16 +301,65 @@ fn run_udp_event_loop(
     }
 }
 
+type ServerResult = Result<(), Box<dyn Error + Send + Sync>>;
+
+fn run_mt_udp_event_loop(
+    address: &String,
+    fixed_update: Duration,
+    mut handler: impl EventHandler + Send,
+) -> ServerResult {
+    // Socket
+    let socket = UdpSocket::bind(address)?;
+    let local_addr = socket.local_addr()?;
+
+    handler.listening(&local_addr);
+
+    let handler_lock = Mutex::new(handler);
+
+    thread::scope(|scope| {
+        // Receive thread: its only way out is an I/O error, carried by `?`
+        let recv_thread = scope.spawn(|| -> ServerResult {
+            let mut buffer = [0u8; 1024];
+
+            loop {
+                let (len, from) = socket.recv_from(&mut buffer)?;
+                // A poisoned lock means the other thread panicked: panic too
+                handler_lock
+                    .lock()
+                    .unwrap()
+                    .message_received(&socket, &from, &buffer[..len]);
+            }
+        });
+
+        // Fixed update, on this thread, for as long as the receive thread lives
+        let mut dt: f32 = 0.0;
+
+        while !recv_thread.is_finished() {
+            let start_time = Instant::now();
+
+            thread::sleep(fixed_update);
+            handler_lock.lock().unwrap().fixed_update(&socket, dt);
+
+            dt = start_time.elapsed().as_secs_f32();
+        }
+
+        // Hand back the receive thread's error, or its panic
+        recv_thread
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
 const PLAYER_SPEED: f32 = 250.0;
 const PLAYERS_TTL: Duration = Duration::from_millis(5000);
 const TICK_INTERVAL: Duration = Duration::from_millis(16);
 
-fn main() -> std::io::Result<()> {
+fn main() -> ServerResult {
     // Params
     let address = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:4000".to_string());
 
-    let mut world = World::new(PLAYER_SPEED, PLAYERS_TTL);
-    run_udp_event_loop(&address, TICK_INTERVAL, &mut world)
+    let world = World::new(PLAYER_SPEED, PLAYERS_TTL);
+    run_mt_udp_event_loop(&address, TICK_INTERVAL, world)
 }
