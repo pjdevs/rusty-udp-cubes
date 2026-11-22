@@ -117,7 +117,7 @@ struct World {
 }
 
 impl World {
-    const MAX_PLAYER_NAME_LENGTH: usize = 128;
+    const MAX_PLAYER_NAME_LENGTH: usize = 24;
 
     fn new(player_speed: f32, players_ttl: Duration) -> Self {
         Self {
