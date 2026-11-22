@@ -114,6 +114,8 @@ struct World {
 }
 
 impl World {
+    const MAX_PLAYER_NAME_LENGTH: usize = 128;
+
     fn new(player_speed: f32, players_ttl: Duration) -> Self {
         Self {
             players: HashMap::new(),
@@ -129,7 +131,11 @@ impl World {
             PlayerPayload::Bye => {
                 self.disconnect(addr);
             }
-            PlayerPayload::Input(player_input_payload) => {
+            PlayerPayload::Input(mut player_input_payload) => {
+                player_input_payload
+                    .name
+                    .truncate(Self::MAX_PLAYER_NAME_LENGTH);
+
                 if let Some(player) = self.players.get_mut(&addr) {
                     player.name = player_input_payload.name;
                     player.direction = player_input_payload.direction;
