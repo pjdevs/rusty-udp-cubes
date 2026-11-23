@@ -495,7 +495,15 @@ fn run_channel_udp_event_loop<T: Send, E: Send, P: Into<String>>(
             let mut buffer = [0u8; 1024];
 
             loop {
-                let (len, from) = socket.recv_from(&mut buffer)?;
+                let (len, from) = match socket.recv_from(&mut buffer) {
+                    Ok(packet) => packet,
+                    #[cfg(windows)]
+                    Err(error) if error.kind() == ErrorKind::ConnectionReset => {
+                        // Winsock reports an ICMP Port Unreachable here after a UDP send.
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 let parse_result = parser(&buffer[..len]);
                 if sender.send(ReceivedMessage { from, parse_result }).is_err() {
                     return Ok(());
