@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+mod shared;
+
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::net::UdpSocket;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::{io, thread};
 
 use ggez::conf::{WindowMode, WindowSetup};
@@ -13,7 +14,9 @@ use ggez::graphics::{self, Color, DrawParam, Mesh, PxScale, Rect, Text, TextFrag
 use ggez::winit::keyboard::{KeyCode, PhysicalKey};
 use ggez::{Context, ContextBuilder, GameResult};
 
-#[derive(Debug)]
+use crate::shared::WORLD_SIZE;
+
+#[derive(Debug, Default, Clone)]
 struct PlayerPayload {
     id: u64,
     name: String,
@@ -75,7 +78,7 @@ impl TryFrom<&str> for PlayerPayload {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default, Clone)]
 struct WorldPayload {
     tick: u64,
     players: Vec<PlayerPayload>,
@@ -133,17 +136,15 @@ impl TryFrom<&str> for WorldPayload {
 }
 
 struct PlayerState {
-    id: u64,
     position: Vec2,
     name: String,
-    // speed: f32,
-    size: Vec2,
-    color: Color,
+    mesh: Mesh,
+    name_text: Text,
 }
 
 struct MainState {
-    socket: UdpSocket,
-    receiver: Receiver<WorldPayload>,
+    socket: Arc<UdpSocket>,
+    cell: SharedCell<KnownServerState>,
     my_name: String,
     my_id: Option<u64>,
     players: HashMap<u64, PlayerState>,
@@ -153,13 +154,13 @@ struct MainState {
 impl MainState {
     fn new(
         _ctx: &mut Context,
-        socket: UdpSocket,
-        receiver: Receiver<WorldPayload>,
+        socket: Arc<UdpSocket>,
+        cell: SharedCell<KnownServerState>,
         my_name: String,
     ) -> GameResult<MainState> {
         Ok(MainState {
             socket,
-            receiver,
+            cell,
             my_name,
             my_id: None,
             players: HashMap::new(),
@@ -170,7 +171,6 @@ impl MainState {
 
 impl EventHandler for MainState {
     fn update(&mut self, ctx: &mut Context) -> GameResult {
-        // let window_size = ctx.gfx.drawable_size();
         let mut direction = Vec2::ZERO;
 
         if ctx
@@ -204,27 +204,57 @@ impl EventHandler for MainState {
             .socket
             .send(format!("{} {} {}", self.my_name, direction.x, direction.y).as_bytes());
 
-        for payload in self.receiver.try_iter() {
-            for player in payload.players {
-                let player_state = self.players.entry(player.id).or_insert(PlayerState {
-                    id: player.id,
-                    position: player.position,
-                    name: player.name.clone(),
-                    size: Vec2::new(50.0, 50.0),
-                    color: Color::CYAN,
-                });
+        let state = if let Ok(s) = self.cell.lock() {
+            s.clone()
+        } else {
+            return Err(ggez::GameError::LockError);
+        };
 
+        let mut known_players = HashSet::new();
+
+        for player in state.last_state.players {
+            let player_state = self.players.entry(player.id).or_insert_with(|| {
+                let position = player.position;
+                let size = Vec2::new(50.0, 50.0);
+                let color = Color::CYAN;
+                let mesh = Mesh::new_rectangle(
+                    ctx,
+                    graphics::DrawMode::fill(),
+                    Rect::new(0.0, 0.0, size.x, size.y),
+                    color,
+                )
+                .expect("Should be able to create a mesh here");
+                let name_text = Text::new(TextFragment {
+                    text: player.name.clone(),
+                    color: Some(Color::WHITE),
+                    scale: Some(PxScale::from(24.0)),
+                    ..Default::default()
+                });
+                PlayerState {
+                    position,
+                    name: player.name.clone(),
+                    mesh,
+                    name_text,
+                }
+            });
+
+            player_state.position = player.position;
+
+            if player.name != player_state.name {
                 player_state.name = player.name;
-                player_state.position = player.position;
+                player_state.name_text = Text::new(TextFragment {
+                    text: player_state.name.clone(),
+                    color: Some(Color::WHITE),
+                    scale: Some(PxScale::from(24.0)),
+                    ..Default::default()
+                });
             }
+
+            known_players.insert(player.id);
         }
 
-        // self.player_state.position +=
-        //     direction * self.player_state.speed * ctx.time.delta().as_secs_f32();
-        // self.player_state.position = Vec2::new(
-        //     self.player_state.position.x.rem_euclid(window_size.0),
-        //     self.player_state.position.y.rem_euclid(window_size.1),
-        // );
+        self.players
+            .retain(|player_id, _| known_players.contains(player_id));
 
         Ok(())
     }
@@ -233,23 +263,9 @@ impl EventHandler for MainState {
         let mut canvas = graphics::Canvas::from_frame(ctx, self.clear_color);
 
         for player in self.players.values() {
-            let rect = Rect::new(
-                player.position.x,
-                player.position.y,
-                player.size.x,
-                player.size.y,
-            );
-            let mesh = Mesh::new_rectangle(ctx, graphics::DrawMode::fill(), rect, player.color)?;
-            canvas.draw(&mesh, DrawParam::default());
-
-            let text = Text::new(TextFragment {
-                text: player.name.clone(),
-                color: Some(Color::WHITE),
-                scale: Some(PxScale::from(24.0)),
-                ..Default::default()
-            });
+            canvas.draw(&player.mesh, DrawParam::default().dest(player.position));
             canvas.draw(
-                &text,
+                &player.name_text,
                 DrawParam::default().dest(player.position + Vec2::NEG_Y * 25.0),
             );
         }
@@ -259,16 +275,23 @@ impl EventHandler for MainState {
     }
 }
 
+#[derive(Debug, Default, Clone)]
+struct KnownServerState {
+    last_state: WorldPayload,
+    previous_state: WorldPayload,
+}
+
 type ClientResult = Result<(), Box<dyn Error + Send + Sync>>;
+type SharedCell<T> = Arc<Mutex<T>>;
 
 pub fn main() -> ClientResult {
     // Params
     let mut args = std::env::args();
-    let address = args.nth(1).unwrap_or_else(|| "127.0.0.1:4000".to_string());
-    let name = args.next().unwrap_or_else(|| "bob".to_string());
+    let name = args.nth(1).unwrap_or_else(|| "bob".to_string());
+    let address = args.next().unwrap_or_else(|| "127.0.0.1:4000".to_string());
 
     // Socket
-    let socket = UdpSocket::bind("127.0.0.1:0")?;
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0")?);
     let local_addr = socket.local_addr()?;
     println!("INFO: Socket bound to {local_addr}");
 
@@ -276,12 +299,13 @@ pub fn main() -> ClientResult {
     println!("INFO: socket connected to {address}");
 
     // Channel
-    let (sender, receiver) = sync_channel(2048);
+    let cell = SharedCell::new(KnownServerState::default().into());
 
     // Receive thread
     let running = Arc::new(AtomicBool::new(true));
-    let rcv_socket = socket.try_clone()?;
+    let rcv_socket = socket.clone();
     let rcv_running = running.clone();
+    let recv_cell = cell.clone();
     let rcv_thread = thread::spawn(move || -> io::Result<()> {
         let mut buffer = [0u8; 1024];
         while rcv_running.load(Ordering::Relaxed) {
@@ -293,7 +317,12 @@ pub fn main() -> ClientResult {
                 continue;
             };
 
-            if sender.send(payload).is_err() {
+            if let Ok(mut state) = recv_cell.lock() {
+                if payload.tick > state.last_state.tick {
+                    state.previous_state = state.last_state.clone();
+                    state.last_state = payload;
+                }
+            } else {
                 break;
             }
         }
@@ -303,10 +332,10 @@ pub fn main() -> ClientResult {
     // Geez
     let (mut ctx, event_loop) = ContextBuilder::new("les_cubes", "pjdevs")
         .window_setup(WindowSetup::default().title("Les Cubes"))
-        .window_mode(WindowMode::default().dimensions(800.0, 600.0))
+        .window_mode(WindowMode::default().dimensions(WORLD_SIZE.x, WORLD_SIZE.y))
         .build()?;
 
-    let state = MainState::new(&mut ctx, socket, receiver, name)?;
+    let state = MainState::new(&mut ctx, socket, cell, name)?;
     event::run(ctx, event_loop, state)?;
 
     running.store(false, Ordering::Relaxed);
