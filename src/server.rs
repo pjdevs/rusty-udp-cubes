@@ -13,7 +13,7 @@ use std::{
 
 use ggez::glam::Vec2;
 
-use crate::shared::WORLD_SIZE;
+use crate::shared::{TICK_INTERVAL, WORLD_SIZE};
 
 struct Player {
     id: u64,
@@ -553,7 +553,6 @@ fn run_channel_udp_event_loop<T: Send, E: Send, P: Into<String>>(
 
 const PLAYER_SPEED: f32 = 250.0;
 const PLAYERS_TTL: Duration = Duration::from_millis(5000);
-const TICK_INTERVAL: Duration = Duration::from_millis(16);
 const MAX_CATCH_UP_TIME: Duration = Duration::from_millis(250);
 const MAX_CHANNEL_MESSAGE_COUNT: usize = 4096;
 

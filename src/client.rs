@@ -1,10 +1,12 @@
 mod shared;
 
+use std::cmp::max;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use std::{io, thread};
 
 use ggez::conf::{WindowMode, WindowSetup};
@@ -14,7 +16,7 @@ use ggez::graphics::{self, Color, DrawParam, Mesh, PxScale, Rect, Text, TextFrag
 use ggez::winit::keyboard::{KeyCode, PhysicalKey};
 use ggez::{Context, ContextBuilder, GameResult};
 
-use crate::shared::WORLD_SIZE;
+use crate::shared::{TICK_INTERVAL, WORLD_SIZE};
 
 #[derive(Debug, Default, Clone)]
 struct PlayerPayload {
@@ -195,6 +197,25 @@ const PLAYER_TEXT_OFFSET: Vec2 = Vec2::new(0.0, -25.0);
 const PLAYER_DEFAULT_COLOR: Color = Color::CYAN;
 const PLAYER_MY_COLOR: Color = Color::YELLOW;
 
+fn create_player_mesh(ctx: &Context) -> Mesh {
+    Mesh::new_rectangle(
+        ctx,
+        graphics::DrawMode::fill(),
+        Rect::new(0.0, 0.0, PLAYER_SIZE.x, PLAYER_SIZE.y),
+        Color::WHITE,
+    )
+    .expect("Should be able to create a mesh here")
+}
+
+fn create_player_name_text(name: &str) -> Text {
+    Text::new(TextFragment {
+        text: name.to_owned(),
+        color: Some(Color::WHITE),
+        scale: Some(PxScale::from(PLAYER_TEXT_SIZE)),
+        ..Default::default()
+    })
+}
+
 impl EventHandler for MainState {
     fn update(&mut self, ctx: &mut Context) -> GameResult {
         let mut direction = Vec2::ZERO;
@@ -239,40 +260,35 @@ impl EventHandler for MainState {
         let mut known_players = HashSet::new();
 
         for player in state.last_state.players {
-            let player_state = self.players.entry(player.id).or_insert_with(|| {
-                let position = player.position;
-                let mesh = Mesh::new_rectangle(
-                    ctx,
-                    graphics::DrawMode::fill(),
-                    Rect::new(0.0, 0.0, PLAYER_SIZE.x, PLAYER_SIZE.y),
-                    Color::WHITE,
-                )
-                .expect("Should be able to create a mesh here");
-                let name_text = Text::new(TextFragment {
-                    text: player.name.clone(),
-                    color: Some(Color::WHITE),
-                    scale: Some(PxScale::from(PLAYER_TEXT_SIZE)),
-                    ..Default::default()
-                });
-                PlayerState {
-                    position,
+            let player_state = self
+                .players
+                .entry(player.id)
+                .or_insert_with(|| PlayerState {
+                    position: player.position,
                     name: player.name.clone(),
-                    mesh,
-                    name_text,
+                    mesh: create_player_mesh(ctx),
+                    name_text: create_player_name_text(&player.name),
                     color: PLAYER_DEFAULT_COLOR,
-                }
-            });
+                });
 
-            player_state.position = player.position;
+            if player_state.position.distance_squared(player.position)
+                > WORLD_SIZE.max_element().powi(2) / 4.0
+            {
+                player_state.position = player.position;
+            } else {
+                let interval = max(
+                    TICK_INTERVAL,
+                    TICK_INTERVAL * (state.last_state.tick - state.previous_tick) as u32,
+                );
+                let alpha = (state.last_received_at.elapsed().as_secs_f32()
+                    / interval.as_secs_f32())
+                .clamp(0.0, 1.0);
+                player_state.position = player_state.position.lerp(player.position, alpha);
+            }
 
             if player.name != player_state.name {
                 player_state.name = player.name;
-                player_state.name_text = Text::new(TextFragment {
-                    text: player_state.name.clone(),
-                    color: Some(Color::WHITE),
-                    scale: Some(PxScale::from(PLAYER_TEXT_SIZE)),
-                    ..Default::default()
-                });
+                player_state.name_text = create_player_name_text(&player_state.name);
             }
 
             known_players.insert(player.id);
@@ -314,11 +330,26 @@ impl EventHandler for MainState {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 struct KnownServerState {
     my_id: Option<u64>,
     last_state: WorldPayload,
-    previous_state: WorldPayload,
+    last_received_at: Instant,
+    previous_tick: u64,
+}
+
+impl Default for KnownServerState {
+    fn default() -> Self {
+        Self {
+            my_id: None,
+            last_state: WorldPayload {
+                tick: 0,
+                players: Vec::new(),
+            },
+            last_received_at: Instant::now(),
+            previous_tick: 0,
+        }
+    }
 }
 
 type ClientResult = Result<(), Box<dyn Error + Send + Sync>>;
@@ -368,8 +399,9 @@ pub fn main() -> ClientResult {
 
             if let Ok(mut state) = recv_cell.lock() {
                 if payload.tick > state.last_state.tick {
-                    state.previous_state = state.last_state.clone();
+                    state.previous_tick = state.last_state.tick;
                     state.last_state = payload;
+                    state.last_received_at = Instant::now();
                 }
             } else {
                 break;
