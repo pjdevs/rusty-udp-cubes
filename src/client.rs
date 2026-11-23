@@ -135,11 +135,31 @@ impl TryFrom<&str> for WorldPayload {
     }
 }
 
+struct YouPayload {
+    id: u64,
+}
+
+impl TryFrom<&str> for YouPayload {
+    type Error = &'static str;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let id = value
+            .strip_prefix("YOU ")
+            .ok_or("Expected YOU prefix")?
+            .trim()
+            .parse()
+            .map_err(|_| "Invalid player ID")?;
+
+        Ok(Self { id })
+    }
+}
+
 struct PlayerState {
     position: Vec2,
     name: String,
     mesh: Mesh,
     name_text: Text,
+    color: Color,
 }
 
 struct MainState {
@@ -168,6 +188,12 @@ impl MainState {
         })
     }
 }
+
+const PLAYER_SIZE: Vec2 = Vec2::new(50.0, 50.0);
+const PLAYER_TEXT_SIZE: f32 = 24.0;
+const PLAYER_TEXT_OFFSET: Vec2 = Vec2::new(0.0, -25.0);
+const PLAYER_DEFAULT_COLOR: Color = Color::CYAN;
+const PLAYER_MY_COLOR: Color = Color::YELLOW;
 
 impl EventHandler for MainState {
     fn update(&mut self, ctx: &mut Context) -> GameResult {
@@ -215,19 +241,17 @@ impl EventHandler for MainState {
         for player in state.last_state.players {
             let player_state = self.players.entry(player.id).or_insert_with(|| {
                 let position = player.position;
-                let size = Vec2::new(50.0, 50.0);
-                let color = Color::CYAN;
                 let mesh = Mesh::new_rectangle(
                     ctx,
                     graphics::DrawMode::fill(),
-                    Rect::new(0.0, 0.0, size.x, size.y),
-                    color,
+                    Rect::new(0.0, 0.0, PLAYER_SIZE.x, PLAYER_SIZE.y),
+                    Color::WHITE,
                 )
                 .expect("Should be able to create a mesh here");
                 let name_text = Text::new(TextFragment {
                     text: player.name.clone(),
                     color: Some(Color::WHITE),
-                    scale: Some(PxScale::from(24.0)),
+                    scale: Some(PxScale::from(PLAYER_TEXT_SIZE)),
                     ..Default::default()
                 });
                 PlayerState {
@@ -235,6 +259,7 @@ impl EventHandler for MainState {
                     name: player.name.clone(),
                     mesh,
                     name_text,
+                    color: PLAYER_DEFAULT_COLOR,
                 }
             });
 
@@ -245,7 +270,7 @@ impl EventHandler for MainState {
                 player_state.name_text = Text::new(TextFragment {
                     text: player_state.name.clone(),
                     color: Some(Color::WHITE),
-                    scale: Some(PxScale::from(24.0)),
+                    scale: Some(PxScale::from(PLAYER_TEXT_SIZE)),
                     ..Default::default()
                 });
             }
@@ -256,6 +281,15 @@ impl EventHandler for MainState {
         self.players
             .retain(|player_id, _| known_players.contains(player_id));
 
+        if state.my_id != self.my_id {
+            self.my_id = state.my_id;
+            if let Some(id) = self.my_id {
+                self.players
+                    .entry(id)
+                    .and_modify(|me| me.color = PLAYER_MY_COLOR);
+            }
+        }
+
         Ok(())
     }
 
@@ -263,10 +297,15 @@ impl EventHandler for MainState {
         let mut canvas = graphics::Canvas::from_frame(ctx, self.clear_color);
 
         for player in self.players.values() {
-            canvas.draw(&player.mesh, DrawParam::default().dest(player.position));
+            canvas.draw(
+                &player.mesh,
+                DrawParam::default()
+                    .dest(player.position)
+                    .color(player.color),
+            );
             canvas.draw(
                 &player.name_text,
-                DrawParam::default().dest(player.position + Vec2::NEG_Y * 25.0),
+                DrawParam::default().dest(player.position + PLAYER_TEXT_OFFSET),
             );
         }
 
@@ -277,6 +316,7 @@ impl EventHandler for MainState {
 
 #[derive(Debug, Default, Clone)]
 struct KnownServerState {
+    my_id: Option<u64>,
     last_state: WorldPayload,
     previous_state: WorldPayload,
 }
@@ -313,6 +353,15 @@ pub fn main() -> ClientResult {
             let Ok(message) = str::from_utf8(&buffer[..len]) else {
                 continue;
             };
+
+            if let Ok(payload) = YouPayload::try_from(message) {
+                let Ok(mut state) = recv_cell.lock() else {
+                    break;
+                };
+                state.my_id = Some(payload.id);
+                continue;
+            }
+
             let Ok(payload) = WorldPayload::try_from(message) else {
                 continue;
             };
